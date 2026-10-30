@@ -1,0 +1,325 @@
+1.CONVOLVER:
+module convolver_1 #(
+    parameter DATA_WIDTH = 8,
+    parameter ACC_WIDTH  = 16
+)(
+    input  wire                    clk,
+    input  wire                    rst,
+    input  wire                    valid_in,
+    input  wire signed [DATA_WIDTH-1:0] weight,
+    input  wire signed [DATA_WIDTH-1:0] act_in,
+    output reg  signed [ACC_WIDTH-1:0]  conv_out,
+    output reg                     valid_out
+);
+
+    wire signed [ACC_WIDTH-1:0] mult;
+    assign mult = weight * act_in;
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            conv_out  <= 0;
+            valid_out <= 0;
+        end else begin
+            valid_out <= valid_in;
+            if (valid_in) begin
+                conv_out <= conv_out + mult;
+            end
+        end
+    end
+
+endmodule
+2.QUANTIZER:
+module quantizer_1 #(
+    parameter IN_WIDTH  = 16,
+    parameter OUT_WIDTH = 8,
+    parameter SHIFT     = 4
+)(
+    input  wire signed [IN_WIDTH-1:0]  data_in,
+    output wire signed [OUT_WIDTH-1:0] data_out
+);
+
+    wire signed [IN_WIDTH-1:0] shifted;
+    assign shifted = data_in >>> SHIFT;
+
+    // Saturate to 8-bit signed integer range [-128, 127]
+    assign data_out = (shifted > 127)  ? 8'sd127 :
+                      (shifted < -128) ? -8'sd128 :
+                      shifted[OUT_WIDTH-1:0];
+ 
+endmodule
+3.RELU:
+module relu_1 #(
+    parameter DATA_WIDTH = 8
+)(
+    input  wire signed [DATA_WIDTH-1:0] data_in,
+    output wire signed [DATA_WIDTH-1:0] data_out
+);
+
+    assign data_out = (data_in[DATA_WIDTH-1] == 1'b1) ? {DATA_WIDTH{1'b0}} : data_in;
+
+endmodule
+4.POOLER:
+module pooler_1 #(
+    parameter DATA_WIDTH = 8
+)(
+    input  wire                    clk,
+    input  wire                    rst,
+    input  wire                    enable,
+    input  wire signed [DATA_WIDTH-1:0] data_in,
+    output reg  signed [DATA_WIDTH-1:0] pooled_out
+);
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            pooled_out <= {DATA_WIDTH{1'b0}};
+        end else if (enable) begin
+            if (data_in > pooled_out)
+                pooled_out <= data_in;
+        end
+    end
+
+endmodule
+5.ACCELERATOR:
+module accelerator_1 #(
+    parameter DATA_WIDTH = 8,
+    parameter ACC_WIDTH  = 16
+)(
+    input  wire                    clk,
+    input  wire                    rst,
+    input  wire                    start,
+    input  wire signed [DATA_WIDTH-1:0] weight,
+    input  wire signed [DATA_WIDTH-1:0] act_in,
+    output reg  signed [DATA_WIDTH-1:0] final_out,
+    output reg                     done
+);
+
+    // FSM States
+    localparam IDLE   = 2'b00,
+               CONV   = 2'b01,
+               POOL   = 2'b10,
+               FINISH = 2'b11;
+
+    reg [1:0] state;
+    reg       conv_en;
+    reg       pool_en;
+
+    wire signed [ACC_WIDTH-1:0]  conv_raw;
+    wire                         conv_valid;
+    wire signed [DATA_WIDTH-1:0] quant_out;
+    wire signed [DATA_WIDTH-1:0] relu_out;
+    wire signed [DATA_WIDTH-1:0] pool_out;
+
+    // Sub-module Instantiations (Using _1 suffixes)
+    convolver_1 #(
+        .DATA_WIDTH(DATA_WIDTH), 
+        .ACC_WIDTH(ACC_WIDTH)
+    ) u_conv (
+        .clk(clk),
+        .rst(rst),
+        .valid_in(conv_en),
+        .weight(weight),
+        .act_in(act_in),
+        .conv_out(conv_raw),
+        .valid_out(conv_valid)
+    );
+
+    quantizer_1 #(
+        .IN_WIDTH(ACC_WIDTH), 
+        .OUT_WIDTH(DATA_WIDTH), 
+        .SHIFT(4)
+    ) u_quant (
+        .data_in(conv_raw),
+        .data_out(quant_out)
+    );
+
+    relu_1 #(
+        .DATA_WIDTH(DATA_WIDTH)
+    ) u_relu (
+        .data_in(quant_out),
+        .data_out(relu_out)
+    );
+
+    pooler_1 #(
+        .DATA_WIDTH(DATA_WIDTH)
+    ) u_pool (
+        .clk(clk),
+        .rst(rst),
+        .enable(pool_en),
+        .data_in(relu_out),
+        .pooled_out(pool_out)
+    );
+
+    // FSM Controller Logic
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            state     <= IDLE;
+            conv_en   <= 0;
+            pool_en   <= 0;
+            done      <= 0;
+            final_out <= 0;
+        end else begin
+            case (state)
+                IDLE: begin
+                    done <= 0;
+                    if (start) begin
+                        conv_en <= 1;
+                        state   <= CONV;
+                    end
+                end
+                CONV: begin
+                    conv_en <= 0;
+                    pool_en <= 1;
+                    state   <= POOL;
+                end
+                POOL: begin
+                    pool_en   <= 0;
+                    final_out <= pool_out;
+                    state     <= FINISH;
+                end
+                FINISH: begin
+                    done  <= 1;
+                    state <= IDLE;
+                end
+            endcase
+        end
+    end
+
+endmodule
+6.ACCELERATOR_TB:
+module tb_accelerator_1;
+
+    // Parameters matching the accelerator_1 module
+    parameter DATA_WIDTH = 8;
+    parameter ACC_WIDTH  = 16;
+
+    // Testbench Signals
+    reg                     clk;
+    reg                     rst;
+    reg                     start;
+    reg  signed [DATA_WIDTH-1:0] weight;
+    reg  signed [DATA_WIDTH-1:0] act_in;
+    wire signed [DATA_WIDTH-1:0] final_out;
+    wire                    done;
+
+    // Instantiate Unit Under Test (UUT)
+    accelerator_1 #(
+        .DATA_WIDTH(DATA_WIDTH),
+        .ACC_WIDTH(ACC_WIDTH)
+    ) uut (
+        .clk(clk),
+        .rst(rst),
+        .start(start),
+        .weight(weight),
+        .act_in(act_in),
+        .final_out(final_out),
+        .done(done)
+    );
+
+    // 100 MHz Clock Generation (Period = 10ns)
+    always #5 clk = ~clk;
+
+    initial begin
+        // Initialize Inputs
+        clk    = 0;
+        rst    = 1;
+        start  = 0;
+        weight = 0;
+        act_in = 0;
+
+        // Apply Reset
+        #20;
+        rst = 0;
+        #10;
+
+        // Test Vector 1: Multiply Weight (6) * Activation Input (4)
+        weight = 8'sd6;
+        act_in = 8'sd4;
+        start  = 1;
+        #10;
+        start  = 0;
+
+        // Wait until accelerator finishes execution cycle
+        wait(done);
+        #10;
+        $display("Test Vector 1 Completed -> Final Output = %d", final_out);
+
+        #30;
+
+        // Test Vector 2: Multiply Weight (10) * Activation Input (2)
+        weight = 8'sd10;
+        act_in = 8'sd2;
+        start  = 1;
+        #10;
+        start  = 0;
+
+        wait(done);
+        #10;
+        $display("Test Vector 2 Completed -> Final Output = %d", final_out);
+
+        #50;
+        $display("Simulation Finished Successfully.");
+        $finish;
+    end
+
+endmodule
+7.ARTY_S7_TOP:
+module arty_s7_top (
+    input  wire       CLK100MHZ, 
+    input  wire       btn_rst,   
+    input  wire       btn_start, 
+    input  wire [3:0] sw,        
+    output reg  [3:0] led        
+);
+
+    wire signed [7:0] weight;
+    wire signed [7:0] act_in;
+    wire signed [7:0] final_out;
+    wire              done;
+
+    assign weight = {4'b0000, sw};
+    assign act_in = 8'sd16; 
+
+    accelerator_1 #(
+        .DATA_WIDTH(8),
+        .ACC_WIDTH(16)
+    ) u_accelerator (
+        .clk(CLK100MHZ),
+        .rst(btn_rst),
+        .start(btn_start),
+        .weight(weight),
+        .act_in(act_in),
+        .final_out(final_out),
+        .done(done)
+    );
+
+    // Directly assign switches to LEDs on 'done' pulse
+    always @(posedge CLK100MHZ or posedge btn_rst) begin
+        if (btn_rst) begin
+            led <= 4'b0000;
+        end else if (done) begin
+            led <= sw; // Mirror SW0->LD2, SW1->LD3, SW2->LD4, SW3->LD5
+        end
+    end
+
+endmodule
+8.CONSTRAINTS:
+## Onboard Clock (100 MHz Oscillator)
+set_property -dict { PACKAGE_PIN R2  IOSTANDARD LVCMOS33 } [get_ports { CLK100MHZ }];
+create_clock -add -name sys_clk_pin -period 10.00 -waveform {0 5} [get_ports { CLK100MHZ }];
+
+## Slide Switches (SW0 - SW3)
+set_property -dict { PACKAGE_PIN H14 IOSTANDARD LVCMOS33 } [get_ports { sw[0] }]; # SW0
+set_property -dict { PACKAGE_PIN H18 IOSTANDARD LVCMOS33 } [get_ports { sw[1] }]; # SW1
+set_property -dict { PACKAGE_PIN G18 IOSTANDARD LVCMOS33 } [get_ports { sw[2] }]; # SW2
+set_property -dict { PACKAGE_PIN M5  IOSTANDARD LVCMOS33 } [get_ports { sw[3] }]; # SW3
+
+## Push Buttons (BTN0 = Reset, BTN1 = Start)
+set_property -dict { PACKAGE_PIN G15 IOSTANDARD LVCMOS33 } [get_ports { btn_rst }];   # BTN0
+set_property -dict { PACKAGE_PIN K16 IOSTANDARD LVCMOS33 } [get_ports { btn_start }]; # BTN1
+
+## Onboard User Green LEDs (LED0, LED1, LED2, LED3)
+set_property -dict { PACKAGE_PIN E18 IOSTANDARD LVCMOS33 } [get_ports { led[0] }]; # LED0 (Bit 0 - LSB)
+set_property -dict { PACKAGE_PIN F13 IOSTANDARD LVCMOS33 } [get_ports { led[1] }]; # LED1 (Bit 1)
+set_property -dict { PACKAGE_PIN E13 IOSTANDARD LVCMOS33 } [get_ports { led[2] }]; # LED2 (Bit 2)
+set_property -dict { PACKAGE_PIN H15 IOSTANDARD LVCMOS33 } [get_ports { led[3] }]; # LED3 (Bit 3 - MSB)
+
